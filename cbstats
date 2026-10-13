@@ -1,0 +1,340 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""cbstats —— CodeBuddy 本地用量统计（对标 ccusage，离线跑，不消耗额度）
+
+数据源（只读）：
+  ~/.codebuddy/projects/<项目目录>/<会话>.jsonl            主会话
+  ~/.codebuddy/projects/<项目目录>/<会话>/subagents/*.jsonl 子代理（默认计入）
+
+每条模型请求取 providerData.rawUsage，字段语义：
+  prompt_tokens               = 总输入（**含**缓存命中）
+  prompt_cache_hit_tokens     = 缓存读（命中）
+  prompt_cache_miss_tokens    = 缓存未命中（真实新增输入）
+  completion_tokens           = 输出（含 thinking）
+  completion_thinking_tokens  = 其中 thinking
+  cache_creation_input_tokens = 缓存写（本机网关为隐式缓存，恒为 0）
+  total_tokens                = 输入 + 输出
+  credit                      = 计费积分（部分模型不记分，如 hy4-preview）
+
+⚠️ 输入已含缓存读，别把「缓存读」再加到「总量」上。
+
+用法：
+  cbstats                      最近 14 天
+  cbstats 2026-09              指定月份
+  cbstats 2026-09-01 2026-09-30 指定区间
+  cbstats --days 30            最近 30 天
+  cbstats --all                全部历史
+  cbstats 2026-09 --by-model   每天按模型拆行
+  cbstats 2026-09 --json       输出 JSON（数字为精确整数）
+  cbstats --exact              表格打印完整整数（默认 M/k 紧凑格式）
+  cbstats --no-subagents       只统计主会话
+"""
+
+import argparse
+import collections
+import datetime
+import glob
+import json
+import os
+import sys
+
+PROJECTS_ROOT = os.path.expanduser("~/.codebuddy/projects")
+
+
+def to_dt(ts):
+    """timestamp 可能是 epoch 秒或毫秒。"""
+    if not isinstance(ts, (int, float)):
+        return None
+    return datetime.datetime.fromtimestamp(ts / 1000 if ts > 1e11 else ts)
+
+
+def collect(include_subagents=True):
+    """返回 {日期: {"model": {...}, ...}} 的按天按模型聚合。"""
+    files = glob.glob(os.path.join(PROJECTS_ROOT, "*", "*.jsonl"))
+    if include_subagents:
+        files += glob.glob(os.path.join(PROJECTS_ROOT, "*", "*", "subagents", "*.jsonl"))
+
+    days = collections.defaultdict(lambda: collections.defaultdict(collections.Counter))
+    for path in files:
+        try:
+            fh = open(path, encoding="utf8", errors="replace")
+        except OSError:
+            continue
+        with fh:
+            for line in fh:
+                # 快速跳过：非模型请求行不含 prompt_tokens
+                if '"prompt_tokens"' not in line and '"input_tokens"' not in line:
+                    continue
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rec = json.loads(line)
+                except ValueError:
+                    continue
+                dt = to_dt(rec.get("timestamp"))
+                if dt is None:
+                    continue
+                prov = rec.get("providerData") or {}
+                raw = prov.get("rawUsage") or {}
+                if "prompt_tokens" in raw:
+                    vals = {
+                        "input": raw["prompt_tokens"],
+                        "output": raw.get("completion_tokens", 0),
+                        "cache_read": raw.get("prompt_cache_hit_tokens", 0),
+                        "cache_miss": raw.get("prompt_cache_miss_tokens", 0),
+                        "cache_write": raw.get("cache_creation_input_tokens", 0)
+                        or raw.get("prompt_cache_write_tokens", 0),
+                        "thinking": raw.get("completion_thinking_tokens", 0),
+                        "total": raw.get("total_tokens", 0),
+                        "credit": raw.get("credit", 0) or 0,
+                    }
+                else:
+                    # 兜底：只用归一化 usage（Anthropic 风格）
+                    usage = (rec.get("message") or {}).get("usage") or {}
+                    if not usage:
+                        continue
+                    vals = {
+                        "input": usage.get("input_tokens", 0),
+                        "output": usage.get("output_tokens", 0),
+                        "cache_read": usage.get("cache_read_input_tokens", 0),
+                        "cache_miss": max(
+                            0,
+                            usage.get("input_tokens", 0)
+                            - usage.get("cache_read_input_tokens", 0),
+                        ),
+                        "cache_write": usage.get("cache_creation_input_tokens", 0),
+                        "thinking": 0,
+                        "total": usage.get("total_tokens", 0),
+                        "credit": 0,
+                    }
+                if not vals["total"]:
+                    vals["total"] = vals["input"] + vals["output"]
+                model = prov.get("model") or (rec.get("message") or {}).get("model") or "unknown"
+                bucket = days[dt.strftime("%Y-%m-%d")][model]
+                bucket["requests"] += 1
+                for k, v in vals.items():
+                    bucket[k] += v
+    return days
+
+
+def resolve_range(args):
+    """返回 (start_date, end_date)，含边界；None 表示不限。"""
+    today = datetime.date.today()
+
+    def parse(s):
+        for fmt in ("%Y-%m-%d", "%Y-%m"):
+            try:
+                return datetime.datetime.strptime(s, fmt).date()
+            except ValueError:
+                continue
+        raise SystemExit(f"无法解析日期：{s}（支持 2026-09 或 2026-09-01）")
+
+    if args.days is not None:
+        if args.range:
+            raise SystemExit("--days 与位置参数不能同时用")
+        if args.days < 1:
+            raise SystemExit("--days 至少为 1")
+        return today - datetime.timedelta(days=args.days - 1), today
+    if args.all:
+        if args.range:
+            raise SystemExit("--all 与位置参数不能同时用")
+        return None, None
+    if not args.range:
+        return today - datetime.timedelta(days=13), today
+    start = parse(args.range[0])
+    end = parse(args.range[1]) if len(args.range) > 1 else None
+    if end is None:
+        if len(args.range[0]) == 7:  # 整月
+            next_month = (start.replace(day=28) + datetime.timedelta(days=4)).replace(day=1)
+            end = next_month - datetime.timedelta(days=1)
+        else:
+            end = start
+    return start, end
+
+
+def in_range(date_str, start, end):
+    d = datetime.date.fromisoformat(date_str)
+    if start and d < start:
+        return False
+    if end and d > end:
+        return False
+    return True
+
+
+def compact(n):
+    if n >= 1e9:
+        return f"{n / 1e9:.2f}B"
+    if n >= 1e6:
+        return f"{n / 1e6:.1f}M"
+    if n >= 1e3:
+        return f"{n / 1e3:.0f}k"
+    return str(int(n))
+
+
+def fmt(n, exact):
+    return f"{int(n):,}" if exact else compact(n)
+
+
+def models_cell(per_model):
+    items = sorted(per_model.items(), key=lambda kv: -kv[1]["total"])
+    if len(items) == 1:
+        return items[0][0]
+    return ",".join(f"{m}({kv['requests']})" for m, kv in items)
+
+
+def render_table(days, start, end, by_model, exact):
+    keys = ("input", "output", "cache_read", "cache_write", "total", "credit", "requests")
+    titles = {
+        "input": "输入Token",
+        "output": "输出Token",
+        "cache_read": "缓存读Token",
+        "cache_write": "缓存写Token",
+        "total": "Token总量",
+        "credit": "积分",
+        "requests": "请求",
+    }
+    widths = {k: max(len(titles[k]), 9) for k in keys}
+    rows = []
+    for date in sorted(days):
+        if not in_range(date, start, end):
+            continue
+        per_model = days[date]
+        if by_model:
+            groups = [(f"{date} {m}", {m: v}) for m, v in sorted(
+                per_model.items(), key=lambda kv: -kv[1]["total"])]
+        else:
+            groups = [(date, per_model)]
+        for label, group in groups:
+            agg = collections.Counter()
+            for v in group.values():
+                agg.update(v)
+            rows.append((label, agg, group))
+    if not rows:
+        print("该区间没有数据。")
+        return
+    label_w = max(12, max(len(label) for label, _, _ in rows))
+    header = f"{'日期':<{label_w}}" + "".join(f"{titles[k]:>14}" for k in keys) + "  使用模型"
+    print(header)
+    print("-" * (len(header) + 24))
+    totals = collections.Counter()
+    for label, agg, group in rows:
+        totals.update(agg)
+        cells = ""
+        for k in keys:
+            if k == "credit":
+                cells += f"{agg[k]:>14,.0f}"
+            elif k == "requests":
+                cells += f"{agg[k]:>14,}"
+            else:
+                cells += f"{fmt(agg[k], exact):>14}"
+        print(f"{label:<{label_w}}{cells}  {models_cell(group)}")
+    print("-" * (len(header) + 24))
+    cells = ""
+    for k in keys:
+        if k == "credit":
+            cells += f"{totals[k]:>14,.0f}"
+        elif k == "requests":
+            cells += f"{totals[k]:>14,}"
+        else:
+            cells += f"{fmt(totals[k], exact):>14}"
+    print(f"{'合计':<{label_w}}{cells}")
+    # 未命中 / thinking 汇总
+    agg_all = collections.Counter()
+    for date in days:
+        if in_range(date, start, end):
+            for v in days[date].values():
+                agg_all.update(v)
+    print(
+        f"\n缓存未命中(真实新增输入) {fmt(agg_all['cache_miss'], exact)}"
+        f" | thinking 输出 {fmt(agg_all['thinking'], exact)}"
+        f" | 有效天数 {len({d for d in days if in_range(d, start, end)})}"
+    )
+    if totals["cache_write"] == 0:
+        print("注：本机网关为隐式自动缓存，缓存写计量恒为 0（非漏统计）。")
+
+
+def render_json(days, start, end, include_subagents):
+    out_days = []
+    totals = collections.Counter()
+    for date in sorted(days):
+        if not in_range(date, start, end):
+            continue
+        per_model = days[date]
+        agg = collections.Counter()
+        for v in per_model.values():
+            agg.update(v)
+        totals.update(agg)
+        out_days.append({
+            "date": date,
+            "inputTokens": agg["input"],
+            "outputTokens": agg["output"],
+            "cacheReadTokens": agg["cache_read"],
+            "cacheWriteTokens": agg["cache_write"],
+            "cacheMissTokens": agg["cache_miss"],
+            "thinkingTokens": agg["thinking"],
+            "totalTokens": agg["total"],
+            "credit": round(agg["credit"], 2),
+            "requests": agg["requests"],
+            "models": {
+                m: {
+                    "requests": v["requests"],
+                    "inputTokens": v["input"],
+                    "outputTokens": v["output"],
+                    "cacheReadTokens": v["cache_read"],
+                    "totalTokens": v["total"],
+                    "credit": round(v["credit"], 2),
+                }
+                for m, v in sorted(per_model.items(), key=lambda kv: -kv[1]["total"])
+            },
+        })
+    print(json.dumps({
+        "generatedAt": datetime.datetime.now().isoformat(timespec="seconds"),
+        "range": {
+            "start": start.isoformat() if start else None,
+            "end": end.isoformat() if end else None,
+        },
+        "includeSubagents": include_subagents,
+        "days": out_days,
+        "totals": {
+            "inputTokens": totals["input"],
+            "outputTokens": totals["output"],
+            "cacheReadTokens": totals["cache_read"],
+            "cacheWriteTokens": totals["cache_write"],
+            "cacheMissTokens": totals["cache_miss"],
+            "thinkingTokens": totals["thinking"],
+            "totalTokens": totals["total"],
+            "credit": round(totals["credit"], 2),
+            "requests": totals["requests"],
+        },
+    }, ensure_ascii=False, indent=2))
+
+
+def main():
+    p = argparse.ArgumentParser(
+        prog="cbstats",
+        description="CodeBuddy 本地用量统计（对标 ccusage，离线只读）",
+        epilog="示例：cbstats 2026-09 / cbstats --days 30 / cbstats 2026-09 --by-model --json",
+    )
+    p.add_argument("range", nargs="*", help="[月份 如 2026-09] 或 [起始日 结束日]")
+    p.add_argument("--days", type=int, help="最近 N 天（含今天）")
+    p.add_argument("--all", action="store_true", help="全部历史")
+    p.add_argument("--by-model", action="store_true", help="每天按模型拆行")
+    p.add_argument("--json", action="store_true", help="输出 JSON")
+    p.add_argument("--exact", action="store_true", help="打印完整整数（默认紧凑 M/k）")
+    p.add_argument("--no-subagents", action="store_true", help="只统计主会话，排除子代理")
+    args = p.parse_args()
+
+    if not os.path.isdir(PROJECTS_ROOT):
+        raise SystemExit(f"找不到 CodeBuddy 项目目录：{PROJECTS_ROOT}")
+
+    start, end = resolve_range(args)
+    days = collect(include_subagents=not args.no_subagents)
+    if args.json:
+        render_json(days, start, end, not args.no_subagents)
+    else:
+        render_table(days, start, end, args.by_model, args.exact)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
